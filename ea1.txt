@@ -30,19 +30,9 @@ input double  TP_CutAll_Dollar = 0.1;          // TP Cut All Positions ($)
 input string  _5="========== GENERAL SETTINGS ==========";
 input double  LotSize = 0.01;                  // Lot Size
 input int     MagicNumber = 12345;              // Magic Number
-
-input string  _6="========== DISPLAY SETTINGS ==========";
-input bool    ShowDisplay = true;              // Show Simple Display
-input int     Display_X = 10;                  // Display X Position
-input int     Display_Y = 50;                  // Display Y Position
-input color   Display_Color = clrWhite;        // Display Color
+input bool    ShowEmergencyButton = true;      // Show Emergency Button
 
 //--- Global Variables
-double TotalProfit = 0;
-double TotalLoss = 0;
-int TotalTrades = 0;
-int WinTrades = 0;
-int LossTrades = 0;
 datetime StartTime;
 
 //+------------------------------------------------------------------+
@@ -51,10 +41,9 @@ datetime StartTime;
 int OnInit()
 {
    StartTime = TimeCurrent();
-   ResetStatistics();
    
-   if(ShowDisplay)
-      CreateDisplay();
+   if(ShowEmergencyButton)
+      CreateEmergencyButton();
    
    Print("Position Manager EA Started - ", Symbol());
    Print("Mode 1 (TP/SL): ", EnableTPSL_Mode ? "ON" : "OFF");
@@ -69,11 +58,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(ShowDisplay)
-      RemoveDisplay();
+   if(ShowEmergencyButton)
+      RemoveEmergencyButton();
       
-   Print("Position Manager EA Stopped - Total Trades: ", TotalTrades, 
-         " | Profit: ", DoubleToString(TotalProfit, 2));
+   Print("Position Manager EA Stopped");
 }
 
 //+------------------------------------------------------------------+
@@ -109,10 +97,18 @@ void OnTick()
          }
       }
    }
-   
-   // Update display
-   if(ShowDisplay)
-      UpdateDisplay();
+}
+
+//+------------------------------------------------------------------+
+//| Handle Chart Events                                             |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long& lparam, const double& dparam, const string& sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == "EmergencyBtn")
+   {
+      EmergencyCut();
+      ObjectSetInteger(0, "EmergencyBtn", OBJPROP_STATE, false);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -203,6 +199,69 @@ bool ClosePosition(int ticket)
       return result;
    }
    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Emergency Cut All Positions                                    |
+//+------------------------------------------------------------------+
+void EmergencyCut()
+{
+   int closedCount = 0;
+   double totalClosed = 0;
+   
+   Print("=== EMERGENCY CUT ACTIVATED ===");
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber)
+         {
+            double profit = OrderProfit() + OrderSwap() + OrderCommission();
+            int ticket = OrderTicket();
+            
+            if(ClosePosition(ticket))
+            {
+               closedCount++;
+               totalClosed += profit;
+               Print("Emergency Close - Ticket: ", ticket, " Profit: $", DoubleToString(profit, 2));
+            }
+         }
+      }
+   }
+   
+   Print("=== EMERGENCY CUT COMPLETED ===");
+   Print("Positions Closed: ", closedCount);
+   Print("Total P/L: $", DoubleToString(totalClosed, 2));
+   
+   Alert("EMERGENCY CUT - ", closedCount, " positions closed. P/L: $", DoubleToString(totalClosed, 2));
+}
+
+//+------------------------------------------------------------------+
+//| Create Emergency Button                                         |
+//+------------------------------------------------------------------+
+void CreateEmergencyButton()
+{
+   ObjectCreate(0, "EmergencyBtn", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_XSIZE, 100);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_YSIZE, 30);
+   ObjectSetString(0, "EmergencyBtn", OBJPROP_TEXT, "EMERGENCY");
+   ObjectSetString(0, "EmergencyBtn", OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_BGCOLOR, clrRed);
+   ObjectSetInteger(0, "EmergencyBtn", OBJPROP_BORDER_COLOR, clrWhite);
+}
+
+//+------------------------------------------------------------------+
+//| Remove Emergency Button                                         |
+//+------------------------------------------------------------------+
+void RemoveEmergencyButton()
+{
+   ObjectDelete(0, "EmergencyBtn");
 }
 
 //+------------------------------------------------------------------+
@@ -313,158 +372,4 @@ double GetPipValue()
       return Point * 10;
    else
       return Point;
-}
-
-//+------------------------------------------------------------------+
-//| Create Display                                                  |
-//+------------------------------------------------------------------+
-void CreateDisplay()
-{
-   string objName = "PositionManagerDisplay";
-   
-   if(ObjectFind(objName) < 0)
-   {
-      ObjectCreate(objName, OBJ_LABEL, 0, 0, 0);
-      ObjectSet(objName, OBJPROP_CORNER, 0);
-      ObjectSet(objName, OBJPROP_XDISTANCE, Display_X);
-      ObjectSet(objName, OBJPROP_YDISTANCE, Display_Y);
-      ObjectSetText(objName, "", 10, "Arial", Display_Color);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Update Display                                                  |
-//+------------------------------------------------------------------+
-void UpdateDisplay()
-{
-   string objName = "PositionManagerDisplay";
-   string displayText = "";
-   
-   // Count positions by mode
-   int regularPositions = 0;
-   int martingalePositions = 0;
-   double regularPL = 0;
-   double martingalePL = 0;
-   
-   for(int i = 0; i < OrdersTotal(); i++)
-   {
-      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
-      {
-         if(OrderSymbol() == Symbol())
-         {
-            double profit = OrderProfit() + OrderSwap() + OrderCommission();
-            
-            if(OrderMagicNumber() == MagicNumber)
-            {
-               martingalePositions++;
-               martingalePL += profit;
-            }
-            else
-            {
-               regularPositions++;
-               regularPL += profit;
-            }
-         }
-      }
-   }
-   
-   // Update statistics from history
-   UpdateStatistics();
-   
-   displayText = "=== POSITION MANAGER ===\n";
-   displayText += "Symbol: " + Symbol() + "\n";
-   displayText += "TP/SL Mode: " + (EnableTPSL_Mode ? "ON" : "OFF") + "\n";
-   displayText += "Trailing Mode: " + (EnableTrailing_Mode ? "ON" : "OFF") + "\n";
-   displayText += "Martingale Mode: " + (EnableMartingale_Mode ? "ON" : "OFF") + "\n";
-   displayText += "------------------------\n";
-   
-   if(EnableMartingale_Mode && martingalePositions > 0)
-   {
-      displayText += "Martingale Positions: " + IntegerToString(martingalePositions) + "\n";
-      displayText += "Martingale P/L: $" + DoubleToString(martingalePL, 2) + "\n";
-      displayText += "TP Individual: $" + DoubleToString(TP_Dollar, 2) + "\n";
-      displayText += "TP Cut All: $" + DoubleToString(TP_CutAll_Dollar, 2) + "\n";
-      displayText += "------------------------\n";
-   }
-   
-   if(regularPositions > 0)
-   {
-      displayText += "Regular Positions: " + IntegerToString(regularPositions) + "\n";
-      displayText += "Regular P/L: $" + DoubleToString(regularPL, 2) + "\n";
-      displayText += "------------------------\n";
-   }
-   
-   displayText += "Total Trades: " + IntegerToString(TotalTrades) + "\n";
-   displayText += "Win Trades: " + IntegerToString(WinTrades) + "\n";
-   displayText += "Loss Trades: " + IntegerToString(LossTrades) + "\n";
-   displayText += "Win Rate: " + DoubleToString(TotalTrades > 0 ? (WinTrades * 100.0 / TotalTrades) : 0, 1) + "%\n";
-   displayText += "Total Profit: $" + DoubleToString(TotalProfit, 2) + "\n";
-   displayText += "Total Loss: $" + DoubleToString(TotalLoss, 2) + "\n";
-   displayText += "Net P/L: $" + DoubleToString(TotalProfit + TotalLoss, 2) + "\n";
-   
-   ObjectSetText(objName, displayText, 9, "Courier New", Display_Color);
-}
-
-//+------------------------------------------------------------------+
-//| Remove Display                                                  |
-//+------------------------------------------------------------------+
-void RemoveDisplay()
-{
-   ObjectDelete("PositionManagerDisplay");
-}
-
-//+------------------------------------------------------------------+
-//| Update Statistics                                               |
-//+------------------------------------------------------------------+
-void UpdateStatistics()
-{
-   static datetime lastCheck = 0;
-   
-   if(TimeCurrent() - lastCheck < 5) // Check every 5 seconds
-      return;
-      
-   lastCheck = TimeCurrent();
-   
-   // Reset and recalculate
-   TotalProfit = 0;
-   TotalLoss = 0;
-   TotalTrades = 0;
-   WinTrades = 0;
-   LossTrades = 0;
-   
-   for(int i = 0; i < OrdersHistoryTotal(); i++)
-   {
-      if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY))
-      {
-         if(OrderSymbol() == Symbol() && OrderCloseTime() >= StartTime)
-         {
-            double profit = OrderProfit() + OrderSwap() + OrderCommission();
-            TotalTrades++;
-            
-            if(profit > 0)
-            {
-               WinTrades++;
-               TotalProfit += profit;
-            }
-            else if(profit < 0)
-            {
-               LossTrades++;
-               TotalLoss += profit;
-            }
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Reset Statistics                                                |
-//+------------------------------------------------------------------+
-void ResetStatistics()
-{
-   TotalProfit = 0;
-   TotalLoss = 0;
-   TotalTrades = 0;
-   WinTrades = 0;
-   LossTrades = 0;
-   StartTime = TimeCurrent();
 }
