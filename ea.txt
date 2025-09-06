@@ -1,1 +1,858 @@
+//+------------------------------------------------------------------+
+//|                        EA Grid Hedging Follow Trend v1.05       |
+//+------------------------------------------------------------------+
+#property copyright "Grid Hedging System"
+#property link      ""
+#property version   "1.05"
+#property strict
 
+//--- Input Parameters
+input double   InitialLot = 0.01;             // Initial Lot Size
+input int      LayerDistancePips = 20;        // Distance Between Orders (pips)
+input int      PendingDistancePips = 15;      // Initial Pending Distance (pips)
+input double   TakeProfitLayer1 = 5.0;        // TP cut all jika hanya 1 layer ($)
+input double   TakeProfitMartingale = 1.0;    // TP cut all jika sudah ada martingale ($)
+input double   DailyTarget = 200.0;           // Daily Profit Limit ($)
+input int      MagicNumber = 777888;          // Magic Number
+input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_M15; // Signal Timeframe
+input double   MartingaleMultiplier = 2.0;    // Multiplier for Martingale Lot
+
+// additional safety params
+input int      MaxLayers = 6;                 // max grid layers per side
+input double   MaxTotalLots = 10.0;           // cap total lots to avoid huge exposure
+input double   EquityStopPercent = 15.0;      // hentikan EA jika drawdown equity >= X% dari balance
+input bool     UseSignalDirectionOnly = false;// if true place only one side according to signal
+
+//--- Global Variables
+bool tradingActive = false;
+datetime lastSignalBarTime = 0;
+int todayDay = 0;
+bool eaActive = true;
+datetime lastGridCheck = 0;
+int lastPositionCount = 0;
+int buyLayerCount = 0;
+int sellLayerCount = 0;
+
+//+------------------------------------------------------------------+
+//| Helper: Safe OrderSend wrapper                                   |
+//+------------------------------------------------------------------+
+int SafeOrderSend(string symbol, int cmd, double lots, double price, int slippage, double stoploss, double takeprofit, string comment, int magic, datetime expiration, color arrow_color)
+{
+   int ticket = OrderSend(symbol, cmd, lots, price, slippage, stoploss, takeprofit, comment, magic, expiration, arrow_color);
+   if(ticket <= 0)
+   {
+      int err = GetLastError();
+      Print("OrderSend failed. cmd=", cmd, " lots=", DoubleToString(lots,2), " price=", DoubleToString(price,Digits),
+            " Err=", err, " (", ErrorDescription(err), ")");
+      ResetLastError();
+   }
+   return ticket;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Safe OrderDelete wrapper                                 |
+//+------------------------------------------------------------------+
+bool SafeOrderDelete(int ticket)
+{
+   bool result = OrderDelete(ticket);
+   if(!result)
+   {
+      int err = GetLastError();
+      Print("OrderDelete failed. ticket=", ticket, " Err=", err, " (", ErrorDescription(err), ")");
+      ResetLastError();
+   }
+   return result;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Safe OrderClose wrapper                                  |
+//+------------------------------------------------------------------+
+bool SafeOrderClose(int ticket, double lots, double price, int slippage, color arrow_color)
+{
+   bool result = OrderClose(ticket, lots, price, slippage, arrow_color);
+   if(!result)
+   {
+      int err = GetLastError();
+      Print("OrderClose failed. ticket=", ticket, " lots=", DoubleToString(lots,2), " price=", DoubleToString(price,Digits),
+            " Err=", err, " (", ErrorDescription(err), ")");
+      ResetLastError();
+   }
+   return result;
+}
+
+//+------------------------------------------------------------------+
+//| Optional: Human friendly error description (best-effort)         |
+//+------------------------------------------------------------------+
+string ErrorDescription(int code)
+{
+   switch(code)
+   {
+      case 0:   return "NO_ERROR";
+      case 1:   return "NO_ERROR_RETURN";
+      case 2:   return "COMMON_ERROR";
+      case 3:   return "INVALID_TRADE_PARAMETERS";
+      case 4:   return "TRADE_SERVER_BUSY";
+      case 5:   return "OLD_VERSION";
+      case 6:   return "NO_CONNECTION";
+      case 7:   return "NOT_ENOUGH_RIGHTS";
+      case 8:   return "TOO_FREQUENT_REQUESTS";
+      case 9:   return "MALFUNCTIONAL_TRADE";
+      case 134: return "NOT_ENOUGH_MONEY";
+      case 133: return "CLOSE_ORDER_ERROR";
+      case 146: return "ERR_INVALID_STOPS";
+      default:  return "ErrCode:"+IntegerToString(code);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   todayDay = TimeDay(TimeCurrent());
+   eaActive = true;
+   lastGridCheck = 0;
+   lastPositionCount = 0;
+   buyLayerCount = 0;
+   sellLayerCount = 0;
+
+   Print("=== EA GRID HEDGING FOLLOW TREND v", DoubleToString(1.05,2), " ===");
+   Print("InitialLot: ", InitialLot);
+   Print("LayerDistance: ", LayerDistancePips, " pips");
+   Print("PendingDistance: ", PendingDistancePips, " pips");
+   Print("TP Layer1: $", TakeProfitLayer1);
+   Print("TP Martingale: $", TakeProfitMartingale);
+   Print("Daily Limit: $", DailyTarget);
+   Print("Martingale Multiplier: ", MartingaleMultiplier);
+   Print("MaxLayers: ", MaxLayers);
+   Print("MaxTotalLots: ", MaxTotalLots);
+   Print("EquityStopPercent: ", EquityStopPercent);
+   Print("EA Ready!");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   DeleteAllPendingOrders();
+   Print("EA Stopped - All pending orders deleted");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // New day reset
+   if(TimeDay(TimeCurrent()) != todayDay)
+   {
+      todayDay = TimeDay(TimeCurrent());
+      eaActive = true;
+      lastGridCheck = 0;
+      lastPositionCount = 0;
+      buyLayerCount = 0;
+      sellLayerCount = 0;
+      Print("=== NEW DAY - EA RESET ===");
+   }
+
+   // Daily target check (history)
+   double dailyProfit = GetDailyProfit();
+   if(dailyProfit >= DailyTarget)
+   {
+      if(eaActive)
+      {
+         CloseAllPositions();
+         DeleteAllPendingOrders();
+         eaActive = false;
+         Print("=== DAILY TARGET REACHED: $", DoubleToString(dailyProfit, 2), " ===");
+         Print("EA STOPPED for today");
+      }
+      return;
+   }
+
+   if(!eaActive) return;
+
+   // Active cycle: manage grid & TP
+   if(tradingActive || GetPositionCount() > 0)
+   {
+      tradingActive = true;
+
+      if(CheckTakeProfitCutAll())
+      {
+         CloseAllPositions();
+         DeleteAllPendingOrders();
+         ResetEA();
+         Print("=== SIKLUS SELESAI - TP CUT ALL REACHED ===");
+         return;
+      }
+
+      int currentPositionCount = GetPositionCount();
+      if(currentPositionCount != lastPositionCount || TimeCurrent() - lastGridCheck >= 5)
+      {
+         ManageGridOrders();
+         lastGridCheck = TimeCurrent();
+         lastPositionCount = currentPositionCount;
+      }
+      return;
+   }
+
+   // If only pendings exist - monitor triggers and special initial logic
+   if(GetPendingCount() > 0)
+   {
+      CheckForTriggeredOrders();
+      return;
+   }
+
+   // Idle: wait for signal and set initial stops
+   if(!tradingActive && GetPositionCount() == 0 && GetPendingCount() == 0)
+   {
+      int signal = GetCandlestickSignal();
+      if(signal != 0)
+      {
+         // place initial two pendings by default unless UseSignalDirectionOnly true
+         SetInitialStopOrders(signal);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get Candlestick Signal (returns +1 = bullish, -1 = bearish, 0=none) |
+//+------------------------------------------------------------------+
+int GetCandlestickSignal()
+{
+   // use the last closed candle (index 1)
+   datetime closedBarTime = iTime(Symbol(), SignalTimeframe, 1);
+   if(closedBarTime <= lastSignalBarTime) return 0;
+
+   double open = iOpen(Symbol(), SignalTimeframe, 1);
+   double close = iClose(Symbol(), SignalTimeframe, 1);
+
+   if(close == open)
+   {
+      lastSignalBarTime = closedBarTime;
+      return 0; // doji
+   }
+
+   lastSignalBarTime = closedBarTime;
+   if(close > open)
+   {
+      Print("SIGNAL DETECTED - Candle closed: BULLISH");
+      return 1;
+   }
+   else
+   {
+      Print("SIGNAL DETECTED - Candle closed: BEARISH");
+      return -1;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Set Initial Stop Orders                                          |
+//| Places two pendings (BuyStop & SellStop) unless UseSignalDirectionOnly=true |
+//+------------------------------------------------------------------+
+void SetInitialStopOrders(int signal)
+{
+   double currentPrice = (Ask + Bid) / 2.0;
+   double distance = PendingDistancePips * Point;
+   if(Digits == 5 || Digits == 3) distance *= 10;
+
+   if(UseSignalDirectionOnly)
+   {
+      if(signal == 1) // bullish -> place buystop only
+      {
+         double buyStopPrice = currentPrice + distance;
+         double buyLot = GetMartingaleLot(buyLayerCount);
+         int buyTicket = SafeOrderSend(Symbol(), OP_BUYSTOP, buyLot, buyStopPrice, 3, 0, 0, "BuyStop-Initial", MagicNumber, 0, clrBlue);
+         if(buyTicket > 0) Print("BuyStop (initial) set: ", buyTicket);
+      }
+      else if(signal == -1)
+      {
+         double sellStopPrice = currentPrice - distance;
+         double sellLot = GetMartingaleLot(sellLayerCount);
+         int sellTicket = SafeOrderSend(Symbol(), OP_SELLSTOP, sellLot, sellStopPrice, 3, 0, 0, "SellStop-Initial", MagicNumber, 0, clrRed);
+         if(sellTicket > 0) Print("SellStop (initial) set: ", sellTicket);
+      }
+   }
+   else
+   {
+      double buyStopPrice = currentPrice + distance;
+      double buyLot = GetMartingaleLot(buyLayerCount);
+      int buyTicket = SafeOrderSend(Symbol(), OP_BUYSTOP, buyLot, buyStopPrice, 3, 0, 0, "BuyStop-Initial", MagicNumber, 0, clrBlue);
+
+      double sellStopPrice = currentPrice - distance;
+      double sellLot = GetMartingaleLot(sellLayerCount);
+      int sellTicket = SafeOrderSend(Symbol(), OP_SELLSTOP, sellLot, sellStopPrice, 3, 0, 0, "SellStop-Initial", MagicNumber, 0, clrRed);
+
+      if(buyTicket > 0 && sellTicket > 0)
+         Print("=== INITIAL STOP ORDERS SET - SIKLUS DIMULAI ===");
+      else
+      {
+         if(buyTicket > 0) SafeOrderDelete(buyTicket);
+         if(sellTicket > 0) SafeOrderDelete(sellTicket);
+         Print("ERROR: Failed to set one or both initial stop orders.");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage Grid Orders                                               |
+//+------------------------------------------------------------------+
+void ManageGridOrders()
+{
+   CheckForTriggeredOrders();
+   if(GetPositionCount() > 0)
+   {
+      AddGridOrders();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for Triggered Orders - enhanced to handle initial pending logic |
+//+------------------------------------------------------------------+
+void CheckForTriggeredOrders()
+{
+   int positionCount = GetPositionCount();
+
+   // If a new position(s) opened but tradingActive false -> handle initial pending swap
+   if(positionCount > 0 && !tradingActive)
+   {
+      // find opened position types
+      int buyPos = GetBuyPositionCount();
+      int sellPos = GetSellPositionCount();
+
+      // if both sides opened (rare), just activate trading
+      if(buyPos > 0 && sellPos > 0)
+      {
+         tradingActive = true;
+         Print("=== TRADING CYCLE ACTIVATED (HEDGED BOTH SIDES) === Positions: ", positionCount);
+         return;
+      }
+
+      // If sell opened (Sell position triggered)
+      if(sellPos > 0 && buyPos == 0)
+      {
+         Print("=== SELL POSITION OPENED -> handle initial pending swap ===");
+         // delete initial buy pending if exists
+         DeleteInitialPending(OP_BUYSTOP);
+
+         // place new buy pending as martingale layer based on buyLayerCount + 1
+         int newLayer = buyLayerCount + 1;
+         double newLot = GetMartingaleLot(newLayer);
+         double currentPrice = (Ask + Bid) / 2.0;
+         double gridDistance = LayerDistancePips * Point;
+         if(Digits == 5 || Digits == 3) gridDistance *= 10;
+         double buyStopPrice = currentPrice + gridDistance;
+
+         if(CanAddLayer(newLayer, newLot))
+         {
+            buyLayerCount = newLayer;
+            int t = SafeOrderSend(Symbol(), OP_BUYSTOP, newLot, buyStopPrice, 3, 0, 0, "BuyStop-Grid-L"+IntegerToString(buyLayerCount), MagicNumber, 0, clrBlue);
+            if(t>0) Print("Added replacement BuyStop (martingale) L", buyLayerCount, " ticket=", t, " lot=", DoubleToString(newLot,2));
+         }
+         tradingActive = true;
+         Print("=== TRADING CYCLE ACTIVATED === Positions: ", positionCount);
+         return;
+      }
+
+      // If buy opened (Buy position triggered)
+      if(buyPos > 0 && sellPos == 0)
+      {
+         Print("=== BUY POSITION OPENED -> handle initial pending swap ===");
+         // delete initial sell pending if exists
+         DeleteInitialPending(OP_SELLSTOP);
+
+         // place new sell pending as martingale layer based on sellLayerCount + 1
+         int newLayer = sellLayerCount + 1;
+         double newLot = GetMartingaleLot(newLayer);
+         double currentPrice = (Ask + Bid) / 2.0;
+         double gridDistance = LayerDistancePips * Point;
+         if(Digits == 5 || Digits == 3) gridDistance *= 10;
+         double sellStopPrice = currentPrice - gridDistance;
+
+         if(CanAddLayer(newLayer, newLot))
+         {
+            sellLayerCount = newLayer;
+            int t = SafeOrderSend(Symbol(), OP_SELLSTOP, newLot, sellStopPrice, 3, 0, 0, "SellStop-Grid-L"+IntegerToString(sellLayerCount), MagicNumber, 0, clrRed);
+            if(t>0) Print("Added replacement SellStop (martingale) L", sellLayerCount, " ticket=", t, " lot=", DoubleToString(newLot,2));
+         }
+         tradingActive = true;
+         Print("=== TRADING CYCLE ACTIVATED === Positions: ", positionCount);
+         return;
+      }
+
+   }
+
+   // default: if positions exist and tradingActive already true, just set flag
+   if(positionCount > 0 && !tradingActive)
+   {
+      tradingActive = true;
+      Print("=== TRADING CYCLE ACTIVATED === Positions: ", positionCount);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Delete initial pending by type if comment contains "Initial"     |
+//+------------------------------------------------------------------+
+void DeleteInitialPending(int orderType)
+{
+   for(int i = OrdersTotal()-1; i>=0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == orderType)
+         {
+            string cm = OrderComment();
+            if(StringFind(cm, "Initial") >= 0)
+            {
+               bool res = SafeOrderDelete(OrderTicket());
+               if(res) Print("Deleted initial pending: ", OrderTicket(), " comment=", cm);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Martingale Lot                                         |
+//+------------------------------------------------------------------+
+double GetMartingaleLot(int layerCount)
+{
+   if(layerCount <= 0) return(NormalizeLot(InitialLot));
+   double lot = InitialLot * MathPow(MartingaleMultiplier, layerCount);
+   return NormalizeLot(lot);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot to broker settings                                 |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+
+   if(lot < minLot) lot = minLot;
+   if(lot > maxLot) lot = maxLot;
+
+   int steps = (int)MathRound(lot / lotStep);
+   double res = steps * lotStep;
+   res = NormalizeDouble(res, 2);
+   if(res <= 0) res = minLot;
+   return res;
+}
+
+//+------------------------------------------------------------------+
+//| Add Grid Orders                                                  |
+//+------------------------------------------------------------------+
+void AddGridOrders()
+{
+   CheckForTriggeredOrders();
+   if(GetPositionCount() > 0)
+   {
+      double gridDistance = LayerDistancePips * Point;
+      if(Digits == 5 || Digits == 3) gridDistance *= 10;
+
+      double highestBuyPrice = GetHighestBuyPrice();
+      double lowestSellPrice = GetLowestSellPrice();
+      double currentPrice = (Ask + Bid) / 2.0;
+
+      // Add one buy grid above highest buy
+      if(highestBuyPrice > 0)
+      {
+         double newBuyStopPrice = highestBuyPrice + gridDistance;
+         if(newBuyStopPrice - currentPrice <= gridDistance * 5)
+         {
+            if(!HasPendingOrderAt(newBuyStopPrice, OP_BUYSTOP))
+            {
+               int candidateLayer = buyLayerCount + 1;
+               double buyLot = GetMartingaleLot(candidateLayer);
+               if(CanAddLayer(candidateLayer, buyLot))
+               {
+                  buyLayerCount = candidateLayer;
+                  int t = SafeOrderSend(Symbol(), OP_BUYSTOP, buyLot, newBuyStopPrice, 3, 0, 0,
+                                        "BuyStop-Grid-L"+IntegerToString(buyLayerCount), MagicNumber, 0, clrBlue);
+                  if(t > 0)
+                     Print("BuyStop Grid L", buyLayerCount, " Added: ", t, " @ ", DoubleToString(newBuyStopPrice,Digits), " Lot:", DoubleToString(buyLot,2));
+               }
+            }
+         }
+      }
+
+      // Add one sell grid below lowest sell
+      if(lowestSellPrice > 0)
+      {
+         double newSellStopPrice = lowestSellPrice - gridDistance;
+         if(currentPrice - newSellStopPrice <= gridDistance * 5)
+         {
+            if(!HasPendingOrderAt(newSellStopPrice, OP_SELLSTOP))
+            {
+               int candidateLayer = sellLayerCount + 1;
+               double sellLot = GetMartingaleLot(candidateLayer);
+               if(CanAddLayer(candidateLayer, sellLot))
+               {
+                  sellLayerCount = candidateLayer;
+                  int t = SafeOrderSend(Symbol(), OP_SELLSTOP, sellLot, newSellStopPrice, 3, 0, 0,
+                                        "SellStop-Grid-L"+IntegerToString(sellLayerCount), MagicNumber, 0, clrRed);
+                  if(t > 0)
+                     Print("SellStop Grid L", sellLayerCount, " Added: ", t, " @ ", DoubleToString(newSellStopPrice,Digits), " Lot:", DoubleToString(sellLot,2));
+               }
+            }
+         }
+      }
+
+      // Hedging orders if appropriate
+      AddHedgingOrders(currentPrice, gridDistance);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Add Hedging Orders                                               |
+//+------------------------------------------------------------------+
+void AddHedgingOrders(double currentPrice, double gridDistance)
+{
+   int buyCount = GetBuyPositionCount();
+   int sellCount = GetSellPositionCount();
+
+   if(buyCount > 0 && GetPendingCountByType(OP_SELLSTOP) == 0)
+   {
+      int candidateLayer = sellLayerCount + 1;
+      double hedgeLot = GetMartingaleLot(candidateLayer);
+      if(CanAddLayer(candidateLayer, hedgeLot))
+      {
+         double sellStopPrice = currentPrice - gridDistance;
+         int t = SafeOrderSend(Symbol(), OP_SELLSTOP, hedgeLot, sellStopPrice, 3, 0, 0,
+                               "SellStop-Hedge-L"+IntegerToString(candidateLayer), MagicNumber, 0, clrOrange);
+         if(t > 0) { sellLayerCount = candidateLayer; Print("SellStop Hedge Added: ", t); }
+      }
+   }
+
+   if(sellCount > 0 && GetPendingCountByType(OP_BUYSTOP) == 0)
+   {
+      int candidateLayer = buyLayerCount + 1;
+      double hedgeLot = GetMartingaleLot(candidateLayer);
+      if(CanAddLayer(candidateLayer, hedgeLot))
+      {
+         double buyStopPrice = currentPrice + gridDistance;
+         int t = SafeOrderSend(Symbol(), OP_BUYSTOP, hedgeLot, buyStopPrice, 3, 0, 0,
+                               "BuyStop-Hedge-L"+IntegerToString(candidateLayer), MagicNumber, 0, clrCyan);
+         if(t > 0) { buyLayerCount = candidateLayer; Print("BuyStop Hedge Added: ", t); }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| TP Check Logic                                                   |
+//+------------------------------------------------------------------+
+bool CheckTakeProfitCutAll()
+{
+   double totalFloating = GetTotalFloating();
+   int posCount = GetPositionCount();
+
+   if(posCount == 1 && totalFloating >= TakeProfitLayer1)
+   {
+      Print("*** TP LAYER 1 REACHED *** Floating=$", DoubleToString(totalFloating,2));
+      return true;
+   }
+   else if(posCount > 1 && totalFloating >= TakeProfitMartingale)
+   {
+      Print("*** TP MARTINGALE REACHED *** Floating=$", DoubleToString(totalFloating,2));
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get Total Floating P&L                                           |
+//+------------------------------------------------------------------+
+double GetTotalFloating()
+{
+   double totalProfit = 0.0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && (OrderType() == OP_BUY || OrderType() == OP_SELL))
+            totalProfit += OrderProfit() + OrderSwap() + OrderCommission();
+      }
+   }
+   return(totalProfit);
+}
+
+//+------------------------------------------------------------------+
+//| Get Position Count                                                |
+//+------------------------------------------------------------------+
+int GetPositionCount()
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && (OrderType() == OP_BUY || OrderType() == OP_SELL))
+            count++;
+      }
+   }
+   return(count);
+}
+
+//+------------------------------------------------------------------+
+//| Get Buy Position Count                                            |
+//+------------------------------------------------------------------+
+int GetBuyPositionCount()
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == OP_BUY)
+            count++;
+      }
+   }
+   return(count);
+}
+
+//+------------------------------------------------------------------+
+//| Get Sell Position Count                                           |
+//+------------------------------------------------------------------+
+int GetSellPositionCount()
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == OP_SELL)
+            count++;
+      }
+   }
+   return(count);
+}
+
+//+------------------------------------------------------------------+
+//| Get Highest Buy Price                                             |
+//+------------------------------------------------------------------+
+double GetHighestBuyPrice()
+{
+   double highestPrice = 0.0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == OP_BUY)
+         {
+            if(OrderOpenPrice() > highestPrice) highestPrice = OrderOpenPrice();
+         }
+      }
+   }
+   return(highestPrice);
+}
+
+//+------------------------------------------------------------------+
+//| Get Lowest Sell Price                                              |
+//+------------------------------------------------------------------+
+double GetLowestSellPrice()
+{
+   double lowestPrice = 0.0;
+   bool found = false;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == OP_SELL)
+         {
+            if(!found || OrderOpenPrice() < lowestPrice)
+            {
+               lowestPrice = OrderOpenPrice();
+               found = true;
+            }
+         }
+      }
+   }
+   return(found ? lowestPrice : 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| Has Pending Order At Price                                        |
+//+------------------------------------------------------------------+
+bool HasPendingOrderAt(double price, int orderType)
+{
+   double tolerance = LayerDistancePips * Point * 0.5;
+   if(Digits == 5 || Digits == 3) tolerance *= 10;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == orderType)
+         {
+            if(MathAbs(OrderOpenPrice() - price) <= tolerance) return true;
+         }
+      }
+   }
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Close All Positions                                                |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   Print("=== CLOSING ALL POSITIONS START ===");
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && (OrderType() == OP_BUY || OrderType() == OP_SELL))
+         {
+            bool res = false;
+            if(OrderType() == OP_BUY)
+               res = SafeOrderClose(OrderTicket(), OrderLots(), Bid, 3, clrGreen);
+            else if(OrderType() == OP_SELL)
+               res = SafeOrderClose(OrderTicket(), OrderLots(), Ask, 3, clrGreen);
+
+            if(res) Print("Closed: ", OrderTicket(), " Type:", (OrderType()==OP_BUY) ? "BUY" : "SELL");
+         }
+      }
+   }
+   Print("=== CLOSING ALL POSITIONS END ===");
+}
+
+//+------------------------------------------------------------------+
+//| Delete All Pending Orders                                         |
+//+------------------------------------------------------------------+
+void DeleteAllPendingOrders()
+{
+   Print("=== DELETING ALL PENDING ORDERS ===");
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() > 1)
+         {
+            bool res = SafeOrderDelete(OrderTicket());
+            if(res) Print("Deleted pending: ", OrderTicket());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset EA                                                          |
+//+------------------------------------------------------------------+
+void ResetEA()
+{
+   tradingActive = false;
+   lastSignalBarTime = 0;
+   lastGridCheck = 0;
+   lastPositionCount = 0;
+   buyLayerCount = 0;
+   sellLayerCount = 0;
+   Print("=== SIKLUS SELESAI - EA SIAP SIGNAL BARU ===");
+}
+
+//+------------------------------------------------------------------+
+//| Get Daily Profit                                                   |
+//+------------------------------------------------------------------+
+double GetDailyProfit()
+{
+   double profit = 0.0;
+   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY))
+      {
+         if(TimeDay(OrderCloseTime()) == todayDay && OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber)
+         {
+            profit += OrderProfit() + OrderSwap() + OrderCommission();
+         }
+      }
+   }
+   return(profit);
+}
+
+//+------------------------------------------------------------------+
+//| Get Pending Orders Count (all types)                              |
+//+------------------------------------------------------------------+
+int GetPendingCount()
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         int t = OrderType();
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() &&
+            (t == OP_BUYLIMIT || t == OP_SELLLIMIT || t == OP_BUYSTOP || t == OP_SELLSTOP))
+         {
+            count++;
+         }
+      }
+   }
+   return(count);
+}
+
+//+------------------------------------------------------------------+
+//| Get Pending Orders Count by Type                                  |
+//+------------------------------------------------------------------+
+int GetPendingCountByType(int orderType)
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() == MagicNumber && OrderSymbol() == Symbol() && OrderType() == orderType)
+            count++;
+      }
+   }
+   return(count);
+}
+
+//+------------------------------------------------------------------+
+//| CanAddLayer - safety checks before adding a new layer/pending    |
+//+------------------------------------------------------------------+
+bool CanAddLayer(int newLayerCount, double newLot)
+{
+   if(newLayerCount > MaxLayers)
+   {
+      Print("Cannot add layer: exceeds MaxLayers (", newLayerCount, ">", MaxLayers, ")");
+      return false;
+   }
+   double totalLots = GetTotalOpenLots() + newLot;
+   if(totalLots > MaxTotalLots)
+   {
+      Print("Cannot add layer: would exceed MaxTotalLots (", totalLots, ">", MaxTotalLots, ")");
+      return false;
+   }
+   double equity = AccountEquity();
+   double balance = AccountBalance();
+   if(balance > 0 && ((balance - equity) / balance) * 100.0 >= EquityStopPercent)
+   {
+      Print("Equity stop reached. EA will stop adding layers.");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| GetTotalOpenLots                                                  |
+//+------------------------------------------------------------------+
+double GetTotalOpenLots()
+{
+   double total=0.0;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber()==MagicNumber && OrderSymbol()==Symbol() && (OrderType()==OP_BUY || OrderType()==OP_SELL))
+            total += OrderLots();
+      }
+   }
+   return total;
+}
+
+//+------------------------------------------------------------------+
+// End of file
+//+------------------------------------------------------------------+
